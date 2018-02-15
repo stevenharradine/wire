@@ -1,0 +1,281 @@
+#!/bin/bash
+#
+# Copyright (c) 2014-2016, Timothy C. Wagner
+# All rights reserved.
+#
+# == Modified Simplified BSD License for FOR NON-COMMERCIAL USE ONLY ==
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#  1. Redistributions of source code must retain the above copyright notice,
+#     this list of conditions and the following disclaimer.
+#  2. Redistributions in binary form must reproduce the above copyright notice,
+#     this list of conditions and the following disclaimer in the documentation
+#     and/or other materials provided with the distribution.
+#  3. Any redistribution, use, or modification is done solely for personal
+#     benefit and not for any commercial purpose or for monetary gain
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+#
+
+# Default configuration in lieu of existing wire.conf file
+# DO NOT edit here; use '$HOME/wired/wire.conf' instead
+ip_address="192.168.1.70"
+command_port="4998"
+ir_remote="default"
+ir_connector="1"
+digit_delay="0.5"
+update_config=0
+verbose=0
+quietflag=0
+
+declare -A ir_buttons
+declare -a sequence
+
+# Construct the configuration directory if non-existant and attempt
+# to populate with configuration files and remotes from installation
+wired="$HOME/wired"
+if [ ! -e "${wired}/wire.conf" ]; then
+
+	# Directory for configuration files
+	if [ ! -d "${wired}" ]; then
+		mkdir ${wired}
+	fi
+
+	# Directory for saved IR remote data
+	if [ ! -d "${wired}/remotes" ]; then
+		mkdir ${wired}/remotes
+	fi
+
+	# Try to populate config file with installed data
+	run_path="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+	if [ -e "${run_path}/wired/wire.conf" ]; then
+		cp ${run_path}/wired/* ${wired} >/dev/null 2>&1
+		cp ${run_path}/wired/remotes/* ${wired}/remotes >/dev/null 2>&1
+	fi
+
+	# If no install config, then create and populate a new one
+	if [ ! -e ${wired}/wire.conf ]; then
+		touch ${wired}/wire.conf
+		update_config=1
+	fi
+fi
+
+# Load configuration file
+config_file="${wired}/wire.conf"
+if [ -e "${config_file}" ]; then
+	source "${config_file}"
+fi
+
+function command_help()
+	{
+	echo -e "\n"\
+	"Usage: wircmd [-b buttons] [-c connector] [-d n] [-h] [-i ip]\n"\
+	"             [-p port] [-q] [-r remote] [-u] [-v]\n\n"\
+	"Where:\n"\
+	"       -b buttons     List of buttons to send\n"\
+	"       -c connector   Set IR output connector    "\
+		"(default: $ir_connector)\n"\
+	"       -d n           Seconds between IR commands"\
+		"(default: $digit_delay)\n"\
+	"       -h             Help (this screen)\n"\
+	"       -i ip          Set ip address             "\
+		"(default: $ip_address)\n"\
+	"       -p port        Set command port           "\
+		"(default: $command_port)\n"\
+	"       -q             Enable quiet mode\n"\
+	"       -r remote      Name of IR remote          "\
+		"(default: $ir_remote)\n"\
+	"       -u             Update config file\n"\
+	"       -v             Verbose mode\n\n"\
+	"Default values are stored in the file $wired/wire.conf"
+	}
+
+function write_config_item()
+	{
+	touch ${config_file}
+	if grep -q "$1" ${config_file}; then
+		sed -i.bak -e "s/$1=.*/$1=\"$2\"/" "${config_file}"
+	else
+		echo "$1=\"$2\"" >> ${config_file}
+	fi
+	}
+
+function write_config_file()
+	{
+	write_config_item "ip_address" "$ip_address"
+	write_config_item "command_port" "$command_port"
+	write_config_item "ir_remote" "$ir_remote"
+        write_config_item "ir_connector" "$ir_connector"
+        write_config_item "digit_delay" "$digit_delay"
+	}
+
+function send_command()
+	{
+	ncat -w 3 --exec "$wired/command.sh $1 $wired"\
+		$ip_address $command_port
+	if [ -f $wired/command.out ]; then
+		command_result=$(cat $wired/command.out)
+		rm $wired/command.out
+	else
+		command_result="ERR, Ncat timeout"
+	fi
+	}
+
+while getopts b:c:d:hi:n:p:qr:uv opt; do
+	case $opt in
+		b) button_list=$OPTARG ;;
+		c) ir_connector=$OPTARG ;;
+		d) digit_delay=$OPTARG ;;
+		h) (( helpflag=1 )) ;;
+		i) ip_address=$OPTARG ;;
+		p) command_port=$OPTARG ;;
+		q) (( quietflag=1 )) ;;
+		r) ir_remote=$OPTARG ;;
+		u) update_config=1 ;;
+		v) (( verbose+=1 )) ;;
+	esac
+done
+
+if [ $update_config -eq 1 ]; then
+	write_config_file
+fi
+
+if [ $quietflag -eq 1 ]; then
+	exec >>${wired}/wircmd.log 2>&1
+else
+	echo "Wagner IR Commander, v1.0"
+fi
+
+if [[ $helpflag -eq 1 && $quietflag -eq 0 ]]; then
+	command_help;
+	exit 0
+fi
+
+# Check for required 'ncat' command
+if [ ! $(command -v ncat) ]; then
+	echo "Ncat is not installed"
+	if [[ $(uname) == "FreeBSD" ]]; then
+		echo "Install with: 'sudo pkg install nmap'"
+	elif [[ $(uname) == "Linux" ]]; then
+		echo "Install with: 'sudo apt-get install nmap'"
+	else
+		echo "Please install package 'nmap'"
+	fi
+	exit
+fi
+
+# Check for required 'sleepenh' command
+if [ ! $(command -v sleepenh) ]; then
+	echo "Sleepenh is not installed"
+	if [[ $(uname) == "FreeBSD" ]]; then
+		echo "Install with: 'sudo pkg install sleepenh'"
+	elif [[ $(uname) == "Linux" ]]; then
+		echo "Install with: 'sudo apt-get install sleepenh'"
+	else
+		echo "Please install package 'sleepenh'"
+	fi
+	exit
+fi
+
+# Write out Ncat command script
+cat <<'EOF' > $wired/command.sh
+#!/bin/bash
+echo -e -n "$1\r" 
+read -t 5 -d $'\r' input
+rc=$?
+if [ $rc -ne 0 ]; then
+	input="ERR:$rc, iTach command timeout"
+fi
+echo $input > $2/command.out
+EOF
+chmod a+x $wired/command.sh
+
+# On program exit remove the Ncat command script
+trap "{ rm $wired/command.sh >/dev/null 2>&1; }" EXIT
+
+# Is there a device at the given IP address?
+send_command "getversion,0"
+if [[ $command_result == *ERR* ]]; then
+	echo "$(date) $command_result"
+	exit 1
+elif [ $verbose -gt 0 ]; then
+	echo "$(date) $command_result"
+fi
+
+# Make sure the device type is IR
+send_command "get_IR,1:1"
+if [[ $command_result == *ERR* ]]; then
+	echo "$(date) $command_result"
+	exit 1
+elif [ $verbose -gt 0 ]; then
+	echo "$(date) $command_result"
+fi
+
+# Check for IR button data file
+ir_file="${wired}/remotes/${ir_remote}.txt"
+if [ ! -f "$ir_file" ]; then
+	echo "$(date) ERROR: Remote data file ${ir_remote}.txt not found"
+	exit 1
+fi
+
+# Make sure user supplied some buttons to send
+if [ ! $button_list ]; then
+	echo "$(date) ERROR: No buttons provided; use '-b' switch"
+	exit 1
+fi
+
+# Parse IR button data file
+while read line; do
+	line=$(echo -n $line | tr -d '\r\n')
+	re="^[[](.*)[]][[:space:]]*(.*)$"
+	if [[ $line =~ $re ]]; then
+		ir_buttons[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
+	fi
+done < "$ir_file"
+if [ ${#ir_buttons[@]} -eq 0 ]; then
+	echo "$(date) ERROR: No buttons in data file"
+	exit 1
+fi
+
+# Parse Buttons, trim spaces and verify button names
+IFS=',' read -a sequence <<< "$button_list"
+for i in "${!sequence[@]}"; do
+	sequence[$i]=$(echo -n "${sequence[$i]}" |\
+		sed -e 's/^[[:space:]]*//g;s/[[:space:]]*$//g')
+	if [ ! ${ir_buttons[${sequence[$i]}]+isset} ]; then
+		echo "$(date) Button '${sequence[$i]}' not stored"
+		close_buttons 0
+		return
+	fi
+done
+
+# Transmit IR sequence
+id=1
+button=""
+for button in "${sequence[@]}"; do
+	ir_out=$(echo -n ${ir_buttons[$button]} |cut -d ',' -f 4-)
+	command="sendir,1:$ir_connector,$id,$ir_out"
+	(( id++ ))
+	if [ $verbose -gt 1 ]; then
+		echo "$(date) $command"
+	fi
+	send_command "$command"
+	if [[ $command_result == *ERR* ]] || [ $verbose -gt 1 ]; then
+		echo "$(date) $command_result"
+	fi
+	sleepenh $digit_delay  >/dev/null 2>&1
+done
+
+exit 0

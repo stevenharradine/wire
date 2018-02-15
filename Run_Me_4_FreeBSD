@@ -1,0 +1,20 @@
+#!/bin/sh
+
+if [ `uname` != "FreeBSD" ]; then
+	echo "Apparently, you are not running FreeBSD"
+	exit 1
+fi
+
+bash=`command -v bash`
+if [ $bash ]; then
+	sed -i .linux "s|^#!/bin/bash|#!${bash}|g" wire
+	sed -i .linux "s|^#!/bin/bash|#!${bash}|g" wirch
+	mv wire.linux wired
+	mv wirch.linux wired
+else
+	echo "Please install 'Bash' then run this utility again"
+fi
+
+if [ ! `command -v ncat` ]; then
+	echo "Please install 'Ncat' then run this utility again"
+fi

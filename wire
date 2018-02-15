@@ -1,0 +1,838 @@
+#!/bin/bash
+#
+# Copyright (c) 2014-2016, Timothy C. Wagner
+# All rights reserved.
+#
+# == Modified Simplified BSD License for FOR NON-COMMERCIAL USE ONLY ==
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#  1. Redistributions of source code must retain the above copyright notice,
+#     this list of conditions and the following disclaimer.
+#  2. Redistributions in binary form must reproduce the above copyright notice,
+#     this list of conditions and the following disclaimer in the documentation
+#     and/or other materials provided with the distribution.
+#  3. Any redistribution, use, or modification is done solely for personal
+#     benefit and not for any commercial purpose or for monetary gain
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+#
+
+echo "Wagner IR Extractor, v2.0"
+
+# Default configuration in lieu of existing wire.conf file
+# DO NOT edit here; use '$HOME/wired/wire.conf' instead
+ip_address="192.168.1.70"
+command_port="4998"
+half_stop="25"
+full_stop="128"
+learn_strength="5"
+learn_attempts="10"
+ir_remote="default"
+update_config=0
+verbose=0
+debug=0
+
+# Learned data
+ir_fullstop=""
+ir_halfstop=""
+ir_repeat=""
+ir_data=""
+
+# Construct the configuration directory if non-existant and attempt
+# to populate with configuration files and remotes from installation
+wired="$HOME/wired"
+if [ ! -e "${wired}/wire.conf" ]; then
+
+	# Directory for configuration files
+	if [ ! -d "${wired}" ]; then
+		mkdir ${wired}
+	fi
+
+	# Directory for saved IR remote data
+	if [ ! -d "${wired}/remotes" ]; then
+		mkdir ${wired}/remotes
+	fi
+
+	# Try to populate config file with installed data
+	run_path="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+	if [ -e "${run_path}/wired/wire.conf" ]; then
+		cp ${run_path}/wired/* ${wired} >/dev/null 2>&1
+		cp ${run_path}/wired/remotes/* ${wired}/remotes >/dev/null 2>&1
+	fi
+
+	# If no install config, then create and populate a new one
+	if [ ! -e ${wired}/wire.conf ]; then
+		touch ${wired}/wire.conf
+		update_config=1
+	fi
+fi
+
+# Load configuration file
+config_file="${wired}/wire.conf"
+if [ -e "${config_file}" ]; then
+	source "${config_file}"
+fi
+ir_file="${wired}/remotes/${ir_remote}.txt"
+
+function command_help()
+	{
+	echo -e "\n"\
+	"Usage: wire [-a n] [-h]"\
+		"[-i ip] [-p port] [-r remote] [-s n] [-u] [-v]\n\n"\
+	"Where:\n"\
+	"       -a n           Set learn attempts       "\
+		"(default: $learn_attempts)\n"\
+	"       -h             Help (this screen)\n"\
+	"       -i ip          Set IP address           "\
+		"(default: $ip_address)\n"\
+	"       -p port        Set command port         "\
+		"(default: $command_port)\n"\
+	"       -r remote      Select IR remote         "\
+		"(default: $ir_remote)\n"\
+	"       -s n           Set learn strength       "\
+		"(default: $learn_strength)\n"\
+	"       -u             Update config file\n"\
+	"       -v             Verbose mode\n"\
+	"Default values are stored in the file $wired/wire.conf"
+	}
+
+function write_config_item()
+	{
+	touch ${config_file}
+	if grep -q "$1" ${config_file}; then
+		sed -i.bak -e "s/$1=.*/$1=\"$2\"/" "${config_file}"
+	else
+		echo "$1=\"$2\"" >> ${config_file}
+	fi
+	}
+
+function write_config_file()
+	{
+	write_config_item "ip_address" "$ip_address"
+	write_config_item "command_port" "$command_port"
+	write_config_item "half_stop" "$half_stop"
+	write_config_item "full_stop" "$full_stop"
+	write_config_item "learn_strength" "$learn_strength"
+	write_config_item "learn_attempts" "$learn_attempts"
+	write_config_item "ir_remote" "$ir_remote"
+	}
+
+cat <<'EOF' > $wired/command.sh
+#!/bin/bash
+echo -e -n "$1\r" 
+read -t 5 -d $'\r' input
+rc=$?
+if [ $rc -ne 0 ]; then
+	input="ERR:$rc, iTach command timeout"
+fi
+echo $input > $2/command.out
+EOF
+chmod a+x $wired/command.sh
+
+function send_command()
+	{
+	ncat -w 3 --exec "$wired/command.sh $1 $wired"\
+		$ip_address $command_port
+	if [ -f $wired/command.out ]; then
+		command_result=$(cat $wired/command.out)
+		rm $wired/command.out
+	else
+		command_result="ERR, Ncat timeout"
+	fi
+	}
+
+cat <<'EOF' > $wired/learn.sh
+#!/bin/bash
+echo $$ > $1/learnpid
+echo -e -n "get_IRL\r" 
+while true; do
+	read -t 15 -d $'\r' input
+	rc=$?
+	if [ ! -e $1/learn.fifo ]; then
+		break
+	fi
+	if [ $rc -ne 0 ]; then
+		echo "ERR:$rc, iTach learn timeout" > $1/learn.fifo
+		break
+	fi
+	echo $input > $1/learn.fifo
+done
+exit 0
+EOF
+chmod a+x $wired/learn.sh
+
+# Tell learn process to quit
+function learn_clean()
+	{
+	if [ -f $wired/learnpid ]; then
+		learnpid=$(cat $wired/learnpid)
+		kill $learnpid >/dev/null 2>&1
+		wait $learnpid >/dev/null 2>&1
+		rm $wired/learnpid >/dev/null 2>&1
+	fi
+	rm $wired/learn.fifo >/dev/null 2>&1
+	}
+
+# On program exit
+function close_up()
+	{
+	learn_clean
+	rm $wired/command.sh >/dev/null 2>&1
+	rm $wired/learn.sh >/dev/null 2>&1
+	}
+trap close_up EXIT
+
+function choose_remote()
+	{
+	local -a remotes
+	echo "Choose a remote:"
+	remotes[1]="NEW REMOTE"
+	echo "1) NEW REMOTE"
+	local i=1
+	for file in $wired/remotes/*.txt; do
+		remote=$(basename "$file" .txt)
+		if [[ $remote == "*" ]]; then
+			break
+		fi
+		let i++
+		remotes[$i]=$remote
+		echo "$i) $remote"
+	done
+	while true; do
+		printf "\nSelect remote (1-${#remotes[@]})? "
+		read id 
+		if [[ -z $id ]]; then
+			return
+		fi
+		if [[ $id < 1 || $id > ${#remotes[@]} ||
+			-z ${remotes[$id]} ]]; then
+			echo "Invalid choice"
+			continue
+		fi
+		remote=${remotes[$id]}
+		if [[ $remote == "NEW REMOTE" ]]; then
+			read -p "Enter remote name: " remote
+		fi
+		ir_remote="$remote"
+		ir_file="${wired}/remotes/${ir_remote}.txt"
+		if [ ! -e "${ir_file}" ]; then
+			touch "${ir_file}"
+		fi
+		write_config_item "ir_remote" "$ir_remote"
+		break
+	done
+	}
+
+declare -a ir_lines
+declare -A ir_buttons
+function open_buttons()
+	{
+	# No file
+	if [ ! -f "$ir_file" ]; then
+		return 1
+	fi
+
+	# Parse IR button data file
+	local i=0
+	while read line; do
+		line=$(echo -n $line | tr -d '\r\n')
+		re="^[[](.*)[]][[:space:]]*(.*)$"
+		if [[ $line =~ $re ]]; then
+			ir_buttons[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
+			ir_lines[$i]="${BASH_REMATCH[1]}"
+			let i++
+		fi
+	done < "$ir_file"
+
+	if [ ${#ir_lines[@]} -eq 0 ]; then
+		return 1
+	fi
+	return 0
+	}
+
+function close_buttons()
+	{
+	local ir_list=""
+	local button=""
+	local line=0
+
+	# Flush changes to file
+	if [ $1 -eq 1 ]; then
+		for button in "${!ir_buttons[@]}"; do
+			ir_list+="[${button}]\t${ir_buttons[$button]}\r\n"
+		done
+		echo -n -e $ir_list | sort > "$ir_file"
+	fi
+
+	# Clear button data list
+	for button in ${!ir_buttons[@]}; do
+		unset ir_buttons[$button]
+	done
+
+	# Clear button sort list
+	for line in ${!ir_lines[@]}; do
+		unset ir_lines[$line]
+	done
+	}
+
+function fuzzycmp()
+	{
+	local i
+	local diff
+	local maxi
+	local pcnt
+	local -a a
+	local -a b
+	IFS=',' read -a a <<< "$1"
+	IFS=',' read -a b <<< "$2"
+	if (( ${#a[@]} != ${#b[@]} )); then		# length must be equal
+		return 1
+	fi
+
+	# Compare all elements for near equality
+	for (( i = 0; i < ${#a[@]}; i++ )); do
+		diff=$(( a[i] - b[i] ))
+		maxi=$(( diff > 0 ? a[i] : b[i] ))
+
+		# Allow up to one count and one percent deviation
+		diff=${diff#-}				# Absolute value
+		pcnt=$(( diff * 100 / ${maxi/0/1} ))	# Avoid divide by zero
+		if (( diff > 1 && pcnt > 1 )); then	
+			return 1
+		fi
+	done
+	return 0
+	}
+
+function learn_a_button()
+	{
+	# Start learning
+	mkfifo $wired/learn.fifo >/dev/null 2>&1
+	ncat --exec "$wired/learn.sh $wired" $ip_address $command_port &
+	local rc
+	read -t 3 -r rc < $wired/learn.fifo
+	if [[ $rc == *ERR* ]]; then
+		echo >&2 $rc
+		learn_clean
+		return
+	elif [ $verbose -gt 1 ]; then
+		echo >&2 $rc
+	fi
+
+	# A place to keep the captured data
+	local -A ir_array
+
+	# Wait for each IR capture
+	local attempt=1
+	local line
+	echo >&2 "Press remote button"
+	while true; do
+		read -t 15 -r line < $wired/learn.fifo
+		if [[ $line == *ERR* ]]; then
+			echo >&2 $line
+			learn_clean
+			return
+		elif [ $debug -gt 1 ]; then
+			echo >&2 "RAW: $line"
+		fi
+
+		# Remove DOS CR from captured data
+		line=$(echo -n $line | sed 's/[[:space:]]*$//'| tr -d '\n')
+
+		# Parse fields into array
+		IFS=',' read -a ir_fields <<< "$line"
+
+		local carrier=${ir_fields[3]}
+		local rep_cnt=${ir_fields[4]}
+		local rep_off=${ir_fields[5]}
+		local data_start=6
+		local data_end=${#ir_fields[@]}
+		local part_off=$data_start
+		local part_num=0
+		local msec_hump=$(( carrier / 1000 * half_stop ))
+		local -a part_hump
+		local -a part_data
+
+		local i
+		if [ $verbose -gt 1 ]; then
+			local duration=0
+			for (( i = data_start; i < data_end; i++ )) do
+				duration=$(( duration + ${ir_fields[$i]} ))
+			done
+			duration=$(( duration / (${carrier/0/1} / 1000) ))
+			echo "IR Burst Length: ${duration}msec"
+		fi
+
+		# Split fields at half-stops (humps) in the data
+		for (( i = part_off + 1 ; i <= data_end ; i=i+2 )) do
+			local space=${ir_fields[$i]}
+			if (( space >= msec_hump )); then
+				(( part_len = i - part_off ))
+				part_hump[$part_num]=$space
+				part_data[$part_num]=$(echo \
+					"${ir_fields[@]:$part_off:$part_len}"\
+					| tr ' ' ',')
+				(( part_off = i + 1 ))
+				(( part_num++ ))
+			fi
+		done
+
+		# Dump split out parts for debugging
+		if [ $debug -gt 0 ]; then
+			for i in ${!part_hump[@]}; do
+				echo >&2 "part ($i) -${part_hump[$i]}- "\
+					"${part_data[$i]}"
+			done
+		fi
+
+		# Remove duplicate parts
+		local dups=0
+		local part_cnt_in=${#part_hump[@]}
+		for (( i = 0; i < part_cnt_in - 1; i++ )); do
+			fuzzycmp ${part_data[$i]} ${part_data[$i+1]}
+			if [ $? -eq 0 ]; then
+				unset part_data[$i]
+				unset part_hump[$i]
+				(( dups++ ))
+			fi
+		done
+
+		# Compress removed parts
+		part_data=("${part_data[@]}")
+		part_hump=("${part_hump[@]}")
+		local part_cnt_out=${#part_hump[@]}
+
+		# Dump summary of parts processed for debugging
+		if [ $debug -gt 0 ]; then
+			echo >&2 "Parts [ in: $part_cnt_in ]"\
+				"[ out: $part_cnt_out ]"\
+				"[ dups: $dups ]"
+		fi
+
+		# Get or compute end-of-message space
+		ir_fullstop=$(( carrier / 1000 * full_stop ))
+		if (( part_cnt_out > 0 )); then
+			ir_fullstop=${part_hump[${part_cnt_out}-1]}
+		fi
+
+		# Get or compute intermediate space
+		ir_halfstop=$ir_fullstop
+		if (( part_cnt_out > 1 )); then
+			ir_halfstop=${part_hump[$part_cnt_out-2]}
+		fi
+
+		# Get repeat codes
+		ir_repeat=""
+		if (( dups > 0 )); then
+			ir_repeat=${part_data[$part_cnt_out-1]}
+			if (( part_cnt_out > 1 )); then
+				unset part_data[$part_cnt_out-1]
+			fi
+		fi
+
+		# Get IR data; merging parts if necessary
+		ir_data=${part_data[0]}
+		for (( i = 1; i < ${#part_data[@]}; i++ )); do
+			ir_data+=",${part_hump[$i-1]},${part_data[$i]}"
+		done
+
+		# Record the strength of this capture
+		local data_seen=0
+		local item
+		for item in ${!ir_array[@]}; do
+			fuzzycmp $ir_data $item
+			if [ $? -eq 0 ]; then
+				(( ir_array[$item]++ ))
+				ir_data=$item
+				data_seen=1
+				break
+			fi
+		done
+		if [ $data_seen -eq 0 ]; then
+			(( ir_array[$ir_data]=1 ))
+		fi
+
+		# More debugging output
+		if [ $debug -gt 0 ]; then
+			echo >&2 "IR DATA: $ir_data"
+		fi
+		if [ $verbose -gt 1 ]; then
+			echo -e >&2 "Count = ${ir_array[$ir_data]}\r"
+		fi
+
+		# Let the user know how things are going
+		printf >&2 "%2d: " $attempt
+		if [ "${ir_array[$ir_data]}" -gt 1 ]; then
+			printf >&2 "good go  ... "
+		elif [ $attempt -gt 1 ]; then
+			printf >&2 "nice try ... "
+		else
+			printf >&2 "got it   ... "
+		fi
+
+		for i in ${!part_hump[@]}; do
+			unset part_hump[$i]
+		done
+		for i in ${!part_data[@]}; do
+			unset part_data[$i]
+		done
+
+		# Have we successfully learned this button?
+		if [ "${ir_array[$ir_data]}" -eq $learn_strength ]; then
+			echo >&2 "last one"
+			break;
+		fi
+
+		# Quit if this has become a lost cause
+		(( attempt++ ))
+		if [ $attempt -gt $learn_attempts ]; then
+			echo >&2 "last attempt"
+			break;
+		fi
+
+		# Keep trying
+		echo >&2 "Press button again"
+	done
+	unset ir_array
+	learn_clean
+
+	send_command "stop_IRL"
+	if [[ $command_result == *ERR* ]] || [ $verbose -gt 1 ]; then
+		echo >&2 $command_result
+	fi
+	
+	if [ $attempt -gt $learn_attempts ]; then
+		unset ir_data
+		echo >&2 "Button capture failed"
+	else
+		echo >&2 "Button capture successful"
+		if [ $verbose -gt 0 ]; then
+			printf >&2 "%0.s-" {1..72}
+			echo -e >&2 "\nCARRIER: ${carrier}"
+			echo -e >&2 "\nIR DATA: ${ir_data}"
+			if [ -n "$ir_repeat" ]; then
+				echo -e >&2 "\nIR REPEAT: ${ir_repeat}"
+			fi
+			if [ -n "$ir_halfstop" ]; then
+				echo -e >&2 "\nIR HALF STOP: ${ir_halfstop}"
+			fi
+			if [ -n "$ir_fullstop" ]; then
+				echo -e >&2 "\nIR FULL STOP: ${ir_fullstop}"
+			fi
+			printf >&2 "%0.s-" {1..72}
+		fi
+		ir_data="${carrier},${rep_cnt},${rep_off},${ir_data}"
+		ir_data="sendir,1:1,1,${ir_data}"
+		if [ -n "$ir_repeat" ]; then
+			ir_data+=",${ir_halfstop},${ir_repeat}"
+		fi
+		ir_data+=",${ir_fullstop}"
+	fi
+	}
+
+function save_a_button()
+	{
+	# Check for learned data
+	if [[ ! $ir_data ]]; then
+		echo "Nothing to save"
+		return
+	fi
+
+	# Prompt for button name
+	local button=""
+	read -p "Enter button name: " button
+	re="[][]"
+	if [[ $button =~ $re ]]; then
+		echo "Cannot use square brackets in name"
+		return
+	fi
+	button=$(echo -n ${button} | \
+		sed -e 's/^[[:space:]]*//g;s/[[:space:]]*$//g' | tr -d '\n')
+	if [ "$button" == "" ]; then
+		echo "Button not saved"
+		return
+	fi
+
+	open_buttons
+
+	# Prompt for overwrite of existing IR data
+	if [ ${ir_buttons[$button]+isset} ]; then
+		local response=""
+		read -r -p "Overwrite button? [y/N] " response
+		response=${response,,} # lowercase
+		if [[ ! $response =~ ^(yes|y)$ ]]; then
+			close_buttons 0
+			echo "Button not saved"
+			return
+		fi
+	fi
+
+	# Write new button to file
+	ir_buttons[$button]=$ir_data
+	close_buttons 1		# write to file
+	echo "Button '$button' saved"
+	unset ir_data
+	}
+
+function delete_a_button()
+	{
+	open_buttons
+	if [ $? -ne 0 ]; then
+		echo "No buttons saved yet"
+		return
+	fi
+
+	# Prompt for name of button
+	local button=""
+	read -p "Enter button name to be deleted: " button
+	button=$(echo -n ${button} | \
+		sed -e 's/^[[:space:]]*//g;s/[[:space:]]*$//g' | tr -d '\n')
+	if [ "$button" == "" ]; then
+		close_buttons 0
+		echo "Button not deleted"
+		return
+	fi
+
+	# Delete specified button, if exists
+	if [ ${ir_buttons[$button]+isset} ]; then
+		unset ir_buttons[$button]
+		close_buttons 1		# write file
+		echo "Button '$button' deleted"
+	else
+		echo "Button '$button' not found"
+	fi
+	}
+
+function list_saved_buttons()
+	{
+	open_buttons
+	if [ $? -ne 0 ]; then
+		echo "No buttons saved yet"
+		return
+	fi
+	printf "%20s %8s %8s %8s %8s\n"\
+		"Button" "Carrier" "Pulses" "Burst" "Spacer"
+	printf "%0.s-" {1..72}
+	echo ""
+	local button=""
+	local -a ir_fields
+	local j
+	for (( j = 0; j < ${#ir_lines[@]}; j++ )); do
+		button=${ir_lines[$j]}
+		local ir_data=$(sed 's/[[:space:]]*$//' <<< \
+			${ir_buttons[$button]})
+		IFS=',' read -a ir_fields <<< "$ir_data"
+		local count=${#ir_fields[@]}
+		local carrier=${ir_fields[3]}
+		local last=${ir_fields[${#ir_fields[@]}-1]}
+		local burst_count=$(( ${#ir_fields[@]} - 7 ))
+		local burst_list=${ir_fields[@]:6:${burst_count}}
+		local pulses=$(( ($burst_count + 1) / 2 ))
+		local sum=0
+		local i=0; for i in ${burst_list[@]}; do
+			(( sum+=$i ))
+		done
+		local burst=$(( $sum * 1000 / ${carrier/0/1} ))
+		local spacer=$(( $last * 1000 / ${carrier/0/1} ))
+		printf "%20.20s %6sHz %8s %6sms %6sms\n"\
+		"$button" "$carrier" "$pulses" "$burst" "$spacer"
+	done
+	close_buttons 0		# don't write file
+	}
+
+function test_button_ir()
+	{
+	local -a modes
+	local -a sequence
+
+	open_buttons
+	if [ $? -ne 0 ]; then
+		echo "No buttons saved yet"
+		return
+	fi
+
+	# Prompt for output connector number
+	echo -e "Select IR output connector:"
+	local i=0; for i in 1 2 3; do
+		send_command "get_IR,1:${i}"
+		modes[$i]=$(echo -n $command_result | cut -d ',' -f3 | \
+			sed -e 's/[[:space:]]*$//' | tr -d '\n')
+		echo "$i) Connector $i [Mode: ${modes[$i]}]"
+	done
+	while true; do
+		printf "\nConnector (1-${#modes[@]})? "
+		local conn=""; read conn
+		echo ""
+		if [[ -z $conn ]]; then
+			close_buttons 0
+			return
+		elif [[ -z ${modes[$conn]} ]]; then
+			echo "Invalid choice"
+			continue
+		elif [[ ${modes[$conn]} != *IR* ]]; then
+			echo "Sorry, IR modes only"
+			continue
+		fi
+		break
+	done
+
+	# Prompt for output button sequence
+	read -p "Enter comma separated list of buttons: " button_list
+	IFS=',' read -a sequence <<< "$button_list"
+
+	# Trim spaces and verify button names
+	for i in "${!sequence[@]}"; do
+		sequence[$i]=$(echo -n "${sequence[$i]}" |\
+			sed -e 's/^[[:space:]]*//g;s/[[:space:]]*$//g')
+		if [ ! ${ir_buttons[${sequence[$i]}]+isset} ]; then
+			echo "Button '${sequence[$i]}' not stored"
+			close_buttons 0
+			return
+		fi
+	done
+
+	# Transmit IR sequence
+	local id=1
+	local ir_out
+	local button=""
+	for button in "${sequence[@]}"; do
+		ir_out=$(echo -n ${ir_buttons[$button]} |cut -d ',' -f 4-)
+		command="sendir,1:$conn,$id,$ir_out"
+		(( id++ ))
+		if [ $verbose -gt 1 ]; then
+			echo $command
+		fi
+		send_command "$command"
+		if [[ $command_result == *ERR* ]] || [ $verbose -gt 1 ]; then
+			echo $command_result
+		fi
+	done
+	echo "done"
+	close_buttons 0
+	}
+
+while getopts a:dhi:p:r:s:uv opt; do
+	case $opt in
+		a) learn_attempts=$OPTAR1 ;;
+		d) (( debug+=1 )) ;;
+		h) command_help; exit ;;
+		i) ip_address=$OPTARG ;;
+		p) command_port=$OPTARG ;;
+		r) ir_remote=$OPTARG
+		   ir_file="${wired}/remotes/${ir_remote}.txt" ;;
+		s) learn_strength=$OPTARG ;;
+		u) update_config=1 ;;
+		v) (( verbose+=1 )) ;;
+	esac
+done
+
+if [ $update_config -eq 1 ]; then
+	write_config_file
+fi
+
+if [ $verbose -gt 0 ]; then
+	echo "Verbose level is $verbose"
+fi
+
+# Check for required 'ncat' command
+if [ ! $(command -v ncat) ]; then
+	echo "Ncat is not installed"
+	if [[ $(uname) == "FreeBSD" ]]; then
+		echo "Install with: 'sudo pkg install nmap'"
+	elif [[ $(uname) == "Linux" ]]; then
+		echo "Install with: 'sudo apt-get install nmap'"
+	else
+		echo "Please install package 'nmap'"
+	fi
+	exit
+fi
+
+# Is there a device at the given IP address?
+echo "Attempting to contact iTach device at $ip_address:$command_port"
+send_command "getversion,0"
+if [[ $command_result == *ERR* ]] || [ $verbose -gt 1 ]; then
+	echo $command_result
+fi
+if [ $(echo $command_result | cut -d ',' -f 1) != "version" ]; then
+	printf "%0.s*" {1..42}
+	echo -e "\n* ERROR: Failed to contact iTach device. *"
+	printf "%0.s*" {1..42}
+	echo -e "\nFor command line help: wire -h"
+	exit
+fi
+
+# Make sure the device type is IR
+send_command "get_IR,1:1"
+if [[ $command_result == *ERR* ]] || [ $verbose -gt 1 ]; then
+	echo $command_result
+fi
+if [ $(echo $command_result | cut -d ',' -f 1) != "IR" ]; then
+	printf "%0.s*" {1..28}
+	echo -e "\n* ERROR: Not an IR device. *"
+	printf "%0.s*" {1..28}
+	echo -e "\nFor command line help: wire -h"
+	exit
+fi
+
+menu=(	"Choose remote"\
+	"Learn a button"\
+	"Save a button" \
+	"Delete a button"\
+	"List saved buttons"\
+	"Test button IR"\
+	"Exit")
+while true; do
+	echo -e "\nSelect menu item:"
+	for i in ${!menu[@]}; do
+		let ii=i+1
+		echo "$ii) ${menu[$i]}"
+	done
+	while true; do
+		printf "\nRemote[$ir_remote] Command (1-${#menu[@]})? "
+		read item
+		echo ""
+		if ! [[ $item =~ ^[0-9]+$ ]] ; then
+			echo "bad choice"
+			break;	# force redraw of menu
+		fi
+		case ${menu[$(( $item - 1 ))]} in
+			"Choose remote")
+				choose_remote
+				;;
+			"Learn a button")
+				learn_a_button
+				;;
+			"Save a button")
+				save_a_button
+				;;
+			"Delete a button")
+				delete_a_button
+				;;
+			"List saved buttons")
+				list_saved_buttons
+				;;
+			"Test button IR")
+				test_button_ir
+				;;
+			"Exit")
+				exit
+				;;
+			*)
+				echo "bad choice"
+				break;	# force redraw of menu
+				;;
+		esac
+	done
+done
